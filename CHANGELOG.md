@@ -1,6 +1,7 @@
 # Cligen Changelog
 
-* [7.7.0](#770) Expected: February 2026
+* [7.8.0](#780) Expected: May 2026
+* [7.7.0](#770) 21 February 2026
 * [7.6.0](#760) 21 November 2025
 * [7.5.0](#750) 29 July 2025
 * [7.4.0](#740) 3 April 2025
@@ -15,8 +16,18 @@
 * [6.1.0](#610) 19 Feb 2023
 * [6.0.0](#600) 29 Nov 2022
 
+## 7.8.0
+Expected: May 2026
+
+### Features
+
+### Corrected Bugs
+
+* Fixed: [Custom Expansion Functions called twice on Pressing TAB](https://github.com/clicon/cligen/issues/92)
+* Fixed: [Validation of Partial match](https://github.com/clicon/cligen/issues/134)
+
 ## 7.7.0
-Expected: February 2026
+21 February 2026
 
 ### Features
 
@@ -27,7 +38,7 @@ Expected: February 2026
 
 Users may have to change how they access the system
 
-* Default TAB behaviour has changed: a single TAB only completes and does NOT show further alternatives, a second TAB will
+* Default TAB behaviour has changed: a single TAB only completes and does NOT show further alternatives, a second TAB shows alternatives.
   * To keep backward compatibility set cligen_tabmode flag `CLIGEN_TABMODE_SHOW` (-t 8)
 
 ### C/CLI-API changes on existing features
