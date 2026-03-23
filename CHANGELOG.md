@@ -23,8 +23,10 @@ Expected: May 2026
 
 ### Corrected Bugs
 
+* Fixed: [cli description should be enumeration's desc not the leaf's. for yang enum type](https://github.com/clicon/clixon/issues/183)
 * Fixed: [Custom Expansion Functions called twice on Pressing TAB](https://github.com/clicon/cligen/issues/92)
 * Fixed: [Validation of Partial match](https://github.com/clicon/cligen/issues/134)
+* Fixed: [Inconsistent error messages for out of range values](https://github.com/clicon/clixon/issues/567)
 
 ## 7.7.0
 21 February 2026
