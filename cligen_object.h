@@ -139,7 +139,11 @@ struct cg_varspec{
     cvec           *cgs_expand_fn_vec; /* expand callback argument vector */
     char           *cgs_translate_fn_str; /* translate function string */
     translate_cb_t *cgs_translate_fn;  /* variable translate function */
-    char           *cgs_choice;        /* list of choices */
+    union {
+        char           *cgs_choice;    /* list of choices, eg "a|b|c" */
+        char           *cgs_keyword;   /* keyword string (mutually exclusive with cgs_choice) */
+    };
+    char           *cgs_choice_help;   /* per-choice help texts, eg "ahelp|bhelp|chelp", parallel to cgs_choice */
     /* int range / str length of cvv_low/upper bound intervals. Note, the two
      * range-cvvs must have the same length. */
     int             cgs_rangelen;
@@ -163,6 +167,7 @@ typedef struct cg_varspec cg_varspec;
 #define CO_FLAGS_OPTION    0x08  /* Generated from optional [] */
 #define CO_FLAGS_MATCH     0x10  /* For sets: avoid selecting same more than once */
 #define CO_FLAGS_ALIAS     0x20  /* Added as an alias (see cligen_alias_cb) */
+#define CO_FLAGS_TREEREF   0x40  /* Set by application treeref-flags callback; propagated to all copies within a tagged expansion */
 
 /* Flags for pt_copy and co_copy
  */
@@ -262,7 +267,8 @@ typedef struct cg_obj cg_obj;
 #define co_translate_fn_str u.cou_var.cgs_translate_fn_str
 #define co_translate_fn  u.cou_var.cgs_translate_fn
 #define co_choice        u.cou_var.cgs_choice
-#define co_keyword       u.cou_var.cgs_choice
+#define co_keyword       u.cou_var.cgs_keyword
+#define co_choice_help   u.cou_var.cgs_choice_help
 #define co_rangelen      u.cou_var.cgs_rangelen
 #define co_rangecvv_low  u.cou_var.cgs_rangecvv_low
 #define co_rangecvv_upp  u.cou_var.cgs_rangecvv_upp
