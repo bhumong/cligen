@@ -74,6 +74,7 @@
 #include "cligen_handle_internal.h"
 #include "cligen_history_internal.h"
 #include "cligen_history.h"
+#include "banned.h"
 
 /*! Makes a copy of the string
  *
@@ -86,12 +87,12 @@ hist_save(const char *p)
 {
     char *s = NULL;
     int   len = strlen(p)+1;
-    char *nl = strchr(p, '\n'); /* newline */
+    const char *nl = strchr(p, '\n'); /* newline */
 
     if (nl) {
         if ((s = malloc(len)) == NULL)
             goto done;
-        strcpy(s, p);
+        memcpy(s, p, len);
         s[len-1] = 0;
     }
     else {
@@ -253,7 +254,10 @@ int
 hist_copy(cligen_handle h,
           char         *ptr)
 {
+    if (ptr == NULL)
+        ptr = "";
     strncpy(cligen_buf(h), ptr, cligen_buf_size(h));
+    cligen_buf(h)[cligen_buf_size(h) - 1] = '\0';
     return 0;
 }
 
@@ -265,7 +269,10 @@ hist_copy_prev(cligen_handle h)
 {
     char *ptr = hist_prev(h);
 
+    if (ptr == NULL)
+        ptr = "";
     strncpy(cligen_buf(h), ptr, cligen_buf_size(h));
+    cligen_buf(h)[cligen_buf_size(h) - 1] = '\0';
     return 0;
 }
 
@@ -279,7 +286,11 @@ hist_copy_pos(cligen_handle h)
     int pos;
 
     pos = hist_pos(h);
-    strncpy(cligen_buf(h), ch->ch_hist_buf[pos], cligen_buf_size(h));
+    if (ch->ch_hist_buf[pos] != NULL)
+        strncpy(cligen_buf(h), ch->ch_hist_buf[pos], cligen_buf_size(h));
+    else
+        cligen_buf(h)[0] = '\0';
+    cligen_buf(h)[cligen_buf_size(h) - 1] = '\0';
     return 0;
 }
 
@@ -291,7 +302,10 @@ hist_copy_next(cligen_handle h)
 {
     char *ptr = hist_next(h);
 
+    if (ptr == NULL)
+        ptr = "";
     strncpy(cligen_buf(h), ptr, cligen_buf_size(h));
+    cligen_buf(h)[cligen_buf_size(h) - 1] = '\0';
     return 0;
 }
 
@@ -326,8 +340,12 @@ cligen_hist_init(cligen_handle h,
                 free(ch->ch_hist_buf[i]);
             ch->ch_hist_buf[i] = NULL;
         }
-    if ((ch->ch_hist_buf = (char**)realloc(ch->ch_hist_buf, ch->ch_hist_size*sizeof(char*))) == NULL)
-        goto done;
+    {
+        char **tmp_buf;
+        if ((tmp_buf = (char**)realloc(ch->ch_hist_buf, ch->ch_hist_size*sizeof(char*))) == NULL)
+            goto done;
+        ch->ch_hist_buf = tmp_buf;
+    }
     ch->ch_hist_cur = 0;
     ch->ch_hist_last = 0;
     ch->ch_hist_pre = 0;

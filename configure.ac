@@ -112,6 +112,9 @@ if test "$YACC" != "bison -y"; then
    AC_MSG_ERROR(CLIGEN does not find bison.  There are several problems with yacc and byacc. Please install bison.)
    # byacc leaks, may need byacc -P?
 fi
+# Override: drop -y (POSIX yacc compat mode) so modern Bison directives work
+# without -Wyacc warnings (api.pure full, %code requires, etc.)
+YACC="bison"
 
 AC_MSG_RESULT(Compiler is $CC)  
 
@@ -167,6 +170,7 @@ AH_BOTTOM([#include <cligen_custom.h>])
 
 AC_CONFIG_FILES([
         Makefile
+        fuzz/Makefile
         test/config.sh
 ])
 AC_OUTPUT

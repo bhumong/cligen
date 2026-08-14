@@ -61,6 +61,14 @@
  *   Shell command:           foo.sh 22 1.2.3.4
  *   CLI input:               > 2.3.4.5
  *   Shell command:           foo.sh 99 1.2.3.4.
+ *
+ * @note SECURITY: WARNING - example/test code only, do not use in production.
+ *   User-supplied CLI values are placed in environment variables and expanded by
+ *   the shell via system(3). POSIX shells do not execute shell metacharacters that
+ *   originate from variable expansion (so ';', '|', '$(...)' in a value are not run
+ *   as commands), but expanded values are still subject to word-splitting and
+ *   pathname (glob) expansion. Only use with trusted input. For untrusted input use
+ *   a non-shell exec (fork + execv) as in pipe_shell_fn().
  */
 int
 cligen_exec_cb(cligen_handle handle,
@@ -68,9 +76,9 @@ cligen_exec_cb(cligen_handle handle,
                cvec         *argv)
 {
     cg_var *cv = NULL;
-    char    buf[64];
+    char   *buf = NULL;
     int     pid;
-    int     ret;
+    int     ret = -1;
     int     status;
 
     if (argv == NULL)
@@ -79,15 +87,20 @@ cligen_exec_cb(cligen_handle handle,
         while ((cv = cvec_each1(cvv, cv)) != NULL) {
             if (cv_const_get(cv))
                 continue;
-            cv2str(cv, buf, sizeof(buf)-1);
-            setenv(cv_name_get(cv), buf, 1 );
+            if ((buf = cv2str_dup(cv)) == NULL)
+                exit(1);
+            setenv(cv_name_get(cv), buf, 1);
+            free(buf);
+            buf = NULL;
         }
-        cv2str(cvec_i(argv, 0), buf, sizeof(buf)-1);
+        if ((buf = cv2str_dup(cvec_i(argv, 0))) == NULL)
+            exit(1);
         ret = system(buf);
+        free(buf);
         exit(ret);
     }
     /* Wait for child to finish */
-    if(waitpid (pid, &status, 0) == pid)
+    if (waitpid(pid, &status, 0) == pid)
         ret = WEXITSTATUS(status);
     else
         ret = -1;
@@ -151,8 +164,9 @@ output_fn(cligen_handle handle,
 
 /*! Output pipe function
  *
- * First argv is a shell command,
- * the following argv:s are names of variables in cvv whose values are appended to the shell
+ * First argv is a shell command prefix (e.g. "grep -e"), the following argv:s are names
+ * of variables in cvv whose values are appended as separate arguments.
+ * Uses execv() to avoid shell injection from user-supplied variable values.
  * @param[in]  h     CLIgen handle / user handle
  * @param[in]  cvv   Vector of variables: function parameters
  * @param[in]  argv  Vector of variables from command-line
@@ -167,30 +181,46 @@ pipe_shell_fn(cligen_handle h,
               cvec         *argv)
 {
     int     retval = -1;
-    cbuf   *cb = NULL;
     cg_var *av;
     cg_var *cv;
     char   *name;
+    char  **exec_argv = NULL;
+    int     exec_argc = 0;
+    char   *cmd_copy = NULL;
+    char   *tok;
+    char   *saveptr;
 
-    if ((cb = cbuf_new()) == NULL){
-        perror("cbuf_new");
+    if (argv == NULL || (av = cvec_i(argv, 0)) == NULL)
+        goto done;
+    if ((exec_argv = calloc(cvec_len(argv) + 64, sizeof(char *))) == NULL){
+        perror("calloc");
         goto done;
     }
-    if (argv && (av = cvec_i(argv, 0)) != NULL){
-        /* First arg is command */
-        cprintf(cb, "%s", cv_string_get(av));
-        /* Rest are names of parameters from cvv */
-        av = NULL;
-        while ((av = cvec_each1(argv, av)) != NULL){
-            name = cv_string_get(av);
-            if ((cv = cvec_find_var(cvv, name)) != NULL)
-                cprintf(cb, " %s", cv_string_get(cv));
-        }
-        retval = execl("/bin/sh", "sh", "-c", cbuf_get(cb), (char *) NULL);
+    /* Tokenize the fixed command prefix into separate args to avoid shell injection */
+    if ((cmd_copy = strdup(cv_string_get(av))) == NULL){
+        perror("strdup");
+        goto done;
     }
+    tok = strtok_r(cmd_copy, " \t", &saveptr);
+    while (tok != NULL){
+        exec_argv[exec_argc++] = tok;
+        tok = strtok_r(NULL, " \t", &saveptr);
+    }
+    /* Append user variable values as separate arguments (not shell-interpreted) */
+    av = NULL;
+    while ((av = cvec_each1(argv, av)) != NULL){
+        name = cv_string_get(av);
+        if ((cv = cvec_find_var(cvv, name)) != NULL)
+            exec_argv[exec_argc++] = cv_string_get(cv);
+    }
+    exec_argv[exec_argc] = NULL;
+    if (exec_argc > 0)
+        retval = execvp(exec_argv[0], exec_argv);
  done:
-    if (cb)
-        cbuf_free(cb);
+    if (cmd_copy)
+        free(cmd_copy);
+    if (exec_argv)
+        free(exec_argv);
     return retval;
 }
 
@@ -225,7 +255,7 @@ str2fn(const char *name,
  */
 static int
 cli_expand_cb(cligen_handle h,
-              char         *fn_str,
+              const char   *fn_str,
               cvec         *cvv,
               cvec         *argv,
               cvec         *commands,     /* vector of function strings */
@@ -275,6 +305,7 @@ usage(char *argv)
             "\t-e \t\tSet automatic expansion/completion for all expand() functions\n"
             "\t-E \t\tExclude keys in callback cvv. Default include keys\n"
             "\t-c \t\tExpand first arg of callback cvv to string matching keywords\n"
+            "\t-n <name> \tHide node with this command name via node filter callback (repeatable)\n"
             "\t-P <mode> \tSet preference mode: 1: tiebreak terminals, 2: also non-terminals\n"
             "\t-t <nr> \tSet tab mode: 1:columns, 2: same pref for vars, 4: all steps\n"
             "\t-s <nr> \tScrolling 0: disable line scrolling, 1: enable line scrolling (default 1)\n"
@@ -282,6 +313,37 @@ usage(char *argv)
             ,
             argv);
     exit(0);
+}
+
+/*! Node filter callback: skip nodes whose co_command appears in the skip-list
+ *
+ * @param[in]  h    CLIgen handle
+ * @param[in]  co   Candidate node
+ * @param[in]  cvv  Accumulated matched tokens
+ * @param[in]  arg  cvec of node names to skip (string values)
+ * @param[out] skip Set to 1 to exclude this node
+ * @retval     0    OK
+ * @retval    -1    Error
+ */
+static int
+node_filter_cb(cligen_handle h,
+               cg_obj       *co,
+               cvec         *cvv,
+               void         *arg,
+               int          *skip)
+{
+    cvec   *skip_names = (cvec *)arg;
+    cg_var *cv = NULL;
+
+    if (co->co_type != CO_COMMAND)
+        return 0;
+    while ((cv = cvec_each(skip_names, cv)) != NULL){
+        if (strcmp(cv_string_get(cv), co->co_command) == 0){
+            *skip = 1;
+            break;
+        }
+    }
+    return 0;
 }
 
 /* Main */
@@ -295,7 +357,7 @@ main(int   argc,
     FILE       *f = stdin;
     char       *argv0 = argv[0];
     char       *filename=NULL;
-    cvec       *globals;   /* global variables from syntax */
+    cvec       *globals = NULL;   /* global variables from syntax */
     cligen_handle  h;
     char       *str;
     int         once = 0;
@@ -307,8 +369,11 @@ main(int   argc,
     int         scrollmode = 0;
     int         exclude_keys = 0;
     int         expand_first = 0;
+    cvec       *skip_names = NULL;   /* Node names to hide via node filter callback */
 
     if ((h = cligen_init()) == NULL)
+        goto done;
+    if ((skip_names = cvec_new(0)) == NULL)
         goto done;
     argv++;argc--;
     for (;(argc>0)&& *argv; argc--, argv++){
@@ -342,6 +407,15 @@ main(int   argc,
             break;
         case 'c': /* Expand first arg of callback cvv */
             expand_first++;
+            break;
+        case 'n': /* Node filter: hide node by name */
+            argc--;argv++;
+            {
+                cg_var *cv;
+                if ((cv = cvec_add(skip_names, CGV_STRING)) == NULL)
+                    goto done;
+                cv_string_set(cv, *argv);
+            }
             break;
         case 'P': /* Return first if several have same preference, for terminals */
             argc--;argv++;
@@ -377,6 +451,9 @@ main(int   argc,
         cligen_expand_first_set(h, 1);
     cligen_lexicalorder_set(h, 1);
     cligen_ignorecase_set(h, 1);
+    if (cvec_len(skip_names) > 0)
+        if (cligen_node_filter_set(h, node_filter_cb, skip_names) < 0)
+            goto done;
     if (set_preference)
         cligen_preference_mode_set(h, set_preference);
 //    cligen_parse_debug(1);
@@ -406,7 +483,7 @@ main(int   argc,
         cligen_comment_set(h, *str);
     if ((str = cvec_find_str(globals, "mode")) != NULL)
         cligen_ph_active_set_byname(h, str);
-    cvec_free(globals);
+
     ph = NULL;
     while ((ph = cligen_ph_each(h, ph)) != NULL){
         if ((pt = cligen_ph_parsetree_get(ph)) != NULL){     /* map functions */
@@ -429,7 +506,11 @@ main(int   argc,
  ok:
     retval = 0;
  done:
+    if (globals)
+        cvec_free(globals);
     fclose(f);
+    if (skip_names)
+        cvec_free(skip_names);
     if (h)
         cligen_exit(h);
     return retval;

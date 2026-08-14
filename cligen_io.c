@@ -63,6 +63,7 @@
 #include "cligen_print.h"
 #include "cligen_io.h"
 #include "cligen_getline.h"
+#include "banned.h"
 
 /*
  * Constants
@@ -142,7 +143,7 @@ cligen_output_scroll(FILE       *f,
     const char *ibend;
     const char *ib0;  /* Moving window start */
     const char *ib1;  /* Moving window end */
-    char       *ibcr;
+    const char *ibcr;
     int         c;
     char       *linebuf = NULL;
     ssize_t     remain;

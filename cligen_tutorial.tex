@@ -7,7 +7,7 @@
 %
 % Title
 %
-\title {CLIgen Manual\\ {\small CLIgen version 7.7}}
+\title {CLIgen Manual\\ {\small CLIgen version 7.8}}
 
 \author{Olof Hagsand}
 %
@@ -18,7 +18,7 @@
 
 % If you want a logo
 % \lhead{\includegraphics[height=9mm]{../../doc/logga_crop.png}}
-\date{November, 2025}
+\date{May, 2026}
 \maketitle
 \setcounter{tocdepth}{2}
 \tableofcontents
@@ -216,6 +216,7 @@ that for example {\tt '?'} can appear in a keyword or value:
 \begin{verbatim}
 > a\?b # Gives the string "a?b"
 > a\\b # Gives the string "a\b"
+> a\|b # Gives the string "a|b"
 \end{verbatim}
 
 \subsection{Help texts}
@@ -373,6 +374,14 @@ An example of an implicit rule is as follows:
 where the pipe tree is added implicitly to all commands.
 
 Pipe trees also work for sub-trees, ie a subtree referenced by the top-level tree may also use output pipes.
+
+\subsubsection{Escaping vertical bar}
+
+If you use a vertical bar elsewhere, eg in values, you need to escape it:
+\begin{verbatim}
+  cli> set a\|b
+  cli> set "a|b"
+\end{verbatim}
 
 \subsection{Sets}
 \label{sec:sets}
@@ -906,6 +915,32 @@ As an assistant, you can use the {\tt -p} option to {\tt cligen\_file} to see wh
 \end{verbatim}
 
 As an alternative solution, you can use the set mechanism as described in Sections~\ref{sec:sets}.
+
+\subsection{Parser resource limits}
+\label{sec:parselimits}
+
+Because the syntactical operators generate basic constructs as described
+above, a small specification can expand into a very large parse tree. This
+is especially true when a choice or grouping is followed by a shared tail,
+for example {\tt (a|b|c) (d|e|f) end}. Each alternative duplicates the
+constructs that follow it, so chaining or nesting such groups makes the
+number of generated objects grow multiplicatively (roughly $O(k^n)$). A
+crafted few-kilobyte specification can therefore expand into millions of
+nodes and take seconds or minutes to parse while consuming large amounts of
+memory (a ``billion-laughs''-style denial of service).
+
+To bound this worst case, the parser enforces two compile-time limits:
+\begin{itemize}
+\item {\tt CLIGEN\_PARSE\_MAX\_OBJS} (default {\tt 500000}) --- the maximum
+  number of parse-tree objects created in a single parse.
+\item {\tt CLIGEN\_PARSE\_MAX\_DEPTH} (default {\tt 1024}) --- the maximum
+  nesting depth of {\tt ()}, {\tt []} and {\tt \{\}} groupings.
+\end{itemize}
+If either limit is exceeded, parsing fails cleanly with an error rather than
+continuing to expand. Both defaults are far larger than any realistic
+hand-written specification and can be overridden at compile time (e.g.,
+{\tt -DCLIGEN\_PARSE\_MAX\_OBJS=...}) if you have an unusually large,
+legitimate specification.
 
 \section{Trees}
 \label{sec:trees}
@@ -1516,6 +1551,58 @@ variable {\tt interfaces}, {\tt expand\_ifname()} will be
 called. Therefore, be careful to avoid blocking calls within the
 callbacks since this may make the CLI less interactive.
 
+\subsection{Tab mode}
+\label{sec:tabmode}
+
+The tab-completion behaviour can be tuned with a bitfield passed to
+{\tt cligen\_tabmode\_set()}.  Each bit enables an independent option:
+
+\begin{description}
+\item[Bit 1 ({\tt CLIGEN\_TABMODE\_COLUMNS}, 0x01)]
+  Controls how alternatives are listed after a TAB.
+  When \emph{off} (default), alternatives are shown in a compact multi-column
+  layout (IOS style).
+  When \emph{on}, each alternative is shown on its own line with its full help
+  text (Junos style).
+
+\item[Bit 2 ({\tt CLIGEN\_TABMODE\_VARS}, 0x02)]
+  Controls the preference between keywords and variables when both are valid
+  at the current position.
+  When \emph{off} (default), keywords are preferred over variables; TAB
+  completes to a keyword and variables are hidden from the completion list.
+  When \emph{on}, keywords and variables have equal preference; both appear
+  in the completion list.
+
+\item[Bit 3 ({\tt CLIGEN\_TABMODE\_STEPS}, 0x04)]
+  Controls how many command levels TAB advances in one keystroke.
+  When \emph{off} (default), each TAB completes exactly one level.
+  When \emph{on}, TAB completes as many unambiguous levels as possible in a
+  single keystroke.
+
+\item[Bit 4 ({\tt CLIGEN\_TABMODE\_SHOW}, 0x08)]
+  Controls whether completion and listing of alternatives happen together.
+  When \emph{off}, the first TAB completes as far as possible and a second
+  TAB shows the available alternatives.
+  When \emph{on}, a single TAB both completes and shows alternatives.
+  This bit is \emph{set by default}.
+
+\item[Bit 5 ({\tt CLIGEN\_TABMODE\_KEYWORD\_AMBIG}, 0x10)]
+  Relevant only when bit 2 ({\tt CLIGEN\_TABMODE\_VARS}) is \emph{off}.
+  When \emph{off} (default), TAB silently auto-completes to a keyword even
+  if a static variable is also valid at the same position --- the variable's
+  existence is never revealed to the user.
+  When \emph{on}, TAB instead shows help listing all alternatives so the user
+  is aware that a variable input is also accepted.
+  Note: this flag does not suppress auto-complete when the keyword was generated
+  by an expand callback.
+
+\end{description}
+
+Example: enable keyword-ambiguity detection alongside the default show flag:
+\begin{verbatim}
+cligen_tabmode_set(h, CLIGEN_TABMODE_SHOW | CLIGEN_TABMODE_KEYWORD_AMBIG);
+\end{verbatim}
+
 \subsection{Translation}
 \label{sec:translate}
 
@@ -1540,6 +1627,123 @@ incstr(cligen_handle h,
 In the function, the CLIgen variable {\tt cv} assumed to be a string, every character is incremented, so that the string HAL would be translated to IBM, for example.
 
 In the same way as expand functions, the translator functions must be registered using {\tt cligen\_translate\_str2fn()}. See the tutorial example and code for more details.
+
+\subsection{Node filter callback}
+\label{sec:node-filter}
+
+An application can register a \emph{node filter callback} to suppress individual
+parse-tree nodes from completion and expansion results. This is useful for
+implementing access control, such as hiding commands from users who lack the
+required privileges.
+
+The callback type is:
+\begin{verbatim}
+int filter_fn(cligen_handle h,
+              cg_obj       *co,
+              cvec         *cvv,
+              void         *arg,
+              int          *skip);
+\end{verbatim}
+
+The parameters are:
+\begin{itemize}
+\item {\tt h} -- CLIgen handle.
+\item {\tt co} -- The candidate node being considered for inclusion in the
+  result.
+\item {\tt cvv} -- The tokens matched so far on the current command line.
+  {\tt CO\_COMMAND} entries have {\tt cv\_name} equal to the keyword;
+  {\tt CO\_VARIABLE} entries carry the user-supplied value.
+\item {\tt arg} -- The opaque pointer supplied at registration time.
+\item {\tt skip} -- Output parameter. Set {\tt *skip = 1} to exclude this node
+  from the completion result; leave it 0 to include the node.
+\end{itemize}
+
+The function returns 0 on success and $-1$ on error.
+
+Registration and lookup use:
+\begin{verbatim}
+cligen_node_filter_set(h, filter_fn, arg);
+cligen_node_filter_get(h, &filter_fn, &arg);
+\end{verbatim}
+
+A minimal example that hides any node whose command name starts with an
+underscore:
+\begin{verbatim}
+int
+hide_internal(cligen_handle h,
+              cg_obj       *co,
+              cvec         *cvv,
+              void         *arg,
+              int          *skip)
+{
+    char *name = co_command(co);
+    if (name && name[0] == '_')
+        *skip = 1;
+    return 0;
+}
+/* Registration */
+cligen_node_filter_set(h, hide_internal, NULL);
+\end{verbatim}
+
+\subsection{Tree reference flags callback}
+\label{sec:treeref-flags}
+
+When a tree reference ({\tt @treename}) is expanded, CLIgen copies all nodes
+from the referenced tree into the current expansion.  An application can
+register a \emph{tree reference flags callback} to attach custom flags to every
+node copied from a given tree reference.  The flags are OR-ed onto each copy
+and are propagated transitively into any nested tree references encountered
+during the same expansion.
+
+The callback type is:
+\begin{verbatim}
+int flags_fn(cligen_handle h,
+             const char   *treename,
+             uint32_t      inherit,
+             uint32_t     *flagsp);
+\end{verbatim}
+
+The parameters are:
+\begin{itemize}
+\item {\tt h} -- CLIgen handle.
+\item {\tt treename} -- Name of the tree being expanded (the part after {\tt @},
+  with the leading {\tt |} stripped for pipe trees).
+\item {\tt inherit} -- Flags already accumulated from an enclosing tree
+  reference expansion; 0 at the top level.
+\item {\tt flagsp} -- Output parameter. The callback writes the flags to OR
+  onto all node copies produced within this expansion.
+\end{itemize}
+
+The function returns 0 on success and $-1$ on error.
+
+Registration and lookup use:
+\begin{verbatim}
+cligen_treeref_flags_fn_set(h, flags_fn);
+cligen_treeref_flags_fn_get(h, &flags_fn);
+\end{verbatim}
+
+A typical use-case is to mark all nodes that originate from a particular
+subtree, so that a command callback or a node filter can later identify them
+via {\tt co\_flags\_get(co)}. For example, to set a custom application flag
+{\tt MY\_FLAG} on every node expanded from the tree named {\tt "config"}:
+\begin{verbatim}
+#define MY_FLAG 0x01
+
+int
+config_tree_flags(cligen_handle h,
+                  const char   *treename,
+                  uint32_t      inherit,
+                  uint32_t     *flagsp)
+{
+    if (strcmp(treename, "config") == 0)
+        *flagsp = inherit | MY_FLAG;
+    else
+        *flagsp = inherit;
+    return 0;
+}
+/* Registration */
+cligen_treeref_flags_fn_set(h, config_tree_flags);
+\end{verbatim}
 
 \subsection{History}
 

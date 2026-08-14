@@ -51,6 +51,7 @@
 #include "cligen_result.h"
 #include "cligen_read.h"
 #include "cligen_syntax.h"
+#include "banned.h"
 
 /*! Parse a string containing a CLIgen spec into a parse-tree
  *
@@ -73,7 +74,7 @@ int
 clispec_parse_str(cligen_handle h,
                   const char   *str,
                   const char   *name,
-                  char         *treename,
+                  const char   *treename,
                   parse_tree   *ptp,
                   cvec         *cvv)
 {
@@ -119,7 +120,7 @@ clispec_parse_str(cligen_handle h,
             goto done;
         if (cgy_init(&cy, cot) < 0)
             goto done;
-        if (cligen_parseparse(&cy) != 0) { /* yacc returns 1 on error */
+        if (cligen_parseparse(&cy, cy.cy_scanner) != 0) { /* yacc returns 1 on error */
             cgy_exit(&cy);
             cgl_exit(&cy);
             goto done;
@@ -144,20 +145,27 @@ clispec_parse_str(cligen_handle h,
         if (cgl_exit(&cy) < 0)
             goto done;
     }
+    else if (ptp == NULL) {
+        /* Empty string: pt was allocated but never registered — free it here */
+        co_pt_clear(cot);
+        pt_free(pt, 0);
+        pt = NULL;
+    }
     if (cvv == NULL) /* Not passed to caller function */
         cvec_free(cy.cy_globals);
     /*
      * Remove the fake top level object and remove references to it.
      * This does not work for (other) trees
      */
-    for (i=0; i<pt_len_get(pt); i++){
+    for (i=0; pt != NULL && i<pt_len_get(pt); i++){
         if ((co=pt_vec_i_get(pt, i)) != NULL)
             co_up_set(co, NULL);
     }
     retval = 0;
   done:
-    if (cot)
-        co_free(cot, 0);
+    if (cot){
+        co_free(cot, retval < 0 ? 1 : 0); /* Free all children if error */
+    }
     if (cy.cy_treename)
         free (cy.cy_treename);
     return retval;
@@ -176,8 +184,8 @@ clispec_parse_str(cligen_handle h,
 int
 clispec_parse_file(cligen_handle h,
                    FILE         *f,
-                   char         *name,
-                   char         *treename,
+                   const char   *name,
+                   const char   *treename,
                    parse_tree   *pt,
                    cvec         *cvv)
 {

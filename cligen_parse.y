@@ -67,8 +67,35 @@
 %type <string> helpstring1
 %type <intval> preline
 
-%lex-param     {void *_cy} /* Add this argument to parse() and lex() function */
-%parse-param   {void *_cy}
+%destructor { free($$); } NAME
+%destructor { free($$); } CHARS
+%destructor { free($$); } charseq
+%destructor { free($$); } helpstring1
+%destructor { free($$); } HELPSTR
+%destructor { free($$); } NUMBER
+%destructor { free($$); } DECIMAL
+%destructor { free($$); } numdec
+%destructor { free($$); } typecast
+%destructor {
+    if ($$) {
+        cgy_choice_pair_t *_p = (cgy_choice_pair_t *)$$;
+        free(_p->names); free(_p->helps); free(_p);
+    }
+} choices choice
+
+%lex-param     {yyscan_t yyscanner}    /* passed to yylex() */
+%parse-param   {void *_cy}             /* passed to yyparse() and yyerror() */
+%parse-param   {yyscan_t yyscanner}    /* passed to yyparse(), yylex(), and yyerror() */
+%define api.pure full                  /* make yylval a local, not a global */
+
+%code requires {
+/* Inject yyscan_t typedef into the generated cligen_parse.tab.h so the
+ * cligen_parseparse() prototype compiles without including the flex header. */
+#ifndef YY_TYPEDEF_YY_SCANNER_T
+#define YY_TYPEDEF_YY_SCANNER_T
+typedef void *yyscan_t;
+#endif
+}
 
 %{
 /* Here starts user C-code */
@@ -76,10 +103,15 @@
 /* typecast macro */
 #define _CY ((cligen_yacc *)_cy)
 
-#define _YYERROR(msg) { cligen_parseerror(_CY, (msg)); YYERROR; }
+#define _YYERROR(msg) { cligen_parseerror(_CY, yyscanner, (msg)); YYERROR; }
 
 /* add _cy to error paramaters */
 #define YY_(msgid) msgid
+
+#ifndef YY_TYPEDEF_YY_SCANNER_T
+#define YY_TYPEDEF_YY_SCANNER_T
+typedef void *yyscan_t;
+#endif
 
 #include "cligen_config.h"
 
@@ -104,6 +136,10 @@
 #include "cligen_syntax.h"
 #include "cligen_handle.h"
 #include "cligen_parse.h"
+#include "banned.h"
+
+/* Forward declaration: reentrant flex accessor, defined in lex.cligen_parse.c */
+char *cligen_parseget_text(yyscan_t yyscanner);
 
 /*! Choice pair: parallel '|'-separated lists of choice names and help texts */
 typedef struct {
@@ -120,8 +156,6 @@ static int debug = 0;
 #define _PARSE_DEBUG(s)
 #endif
 
-extern int cligen_parseget_lineno  (void);
-
 int
 cligen_parse_debug(int d)
 {
@@ -131,23 +165,63 @@ cligen_parse_debug(int d)
 
 /*! CLIGEN parse error routine
  *
- * Also called from yacc generated code *
- * @param[in]  cy  CLIgen yacc parse struct
+ * Also called from yacc generated code.
+ * @param[in]  cy        CLIgen yacc parse struct
+ * @param[in]  yyscanner Reentrant flex scanner handle
+ * @param[in]  s         Error message string
  */
 void cligen_parseerror(void *_cy,
-                       char *s)
+                       yyscan_t yyscanner,
+                       const char *s)
 {
     cligen_yacc *cy = (cligen_yacc *)_cy;
 
     fprintf(stderr, "%s:%d: Error: %s: at or before: '%s'\n",
             cy->cy_name,
-            cy->cy_linenum ,
+            cy->cy_linenum,
             s,
-            cligen_parsetext);
+            cligen_parseget_text(yyscanner));
     return;
 }
 
-#define cligen_parseerror1(cy, s) cligen_parseerror(cy, s)
+#define cligen_parseerror1(cy, s) cligen_parseerror((cy), (cy)->cy_scanner, (s))
+
+/*
+ * Guards against pathological specs that cause exponential parse-tree growth.
+ *
+ * A choice group such as (a|b|c) followed by a shared tail duplicates that tail
+ * under every alternative; chaining or nesting such groups multiplies, so the
+ * number of parse-tree objects can grow as O(k^n) in the number of groups. A
+ * small (few-KB) spec can therefore expand into millions of nodes and take
+ * seconds/minutes to parse while consuming gigabytes of memory.
+ *
+ * CLIGEN_PARSE_MAX_OBJS bounds the total number of parse-tree objects created
+ * in a single parse;
+ * CLIGEN_PARSE_MAX_DEPTH bounds the ()/[]/{} nesting depth.
+ */
+#ifndef CLIGEN_PARSE_MAX_OBJS
+#define CLIGEN_PARSE_MAX_OBJS 500000
+#endif
+#ifndef CLIGEN_PARSE_MAX_DEPTH
+#define CLIGEN_PARSE_MAX_DEPTH 1024
+#endif
+
+/*! Account for a newly created parse-tree object and enforce the object cap.
+ *
+ * @param[in]  cy  CLIgen yacc parse struct
+ * @retval     0   OK, within limit
+ * @retval    -1   Object limit exceeded
+ */
+static int
+cgy_obj_count(cligen_yacc *cy)
+{
+    if (++cy->cy_co_count > CLIGEN_PARSE_MAX_OBJS){
+        cligen_parseerror1(cy, "Too many parse-tree objects: spec too large or "
+                           "pathological (nested choices with shared tail)");
+        return -1;
+    }
+    return 0;
+}
 
 /*! Create a CLIgen variable (cv) and store it in the current variable object
  *
@@ -202,7 +276,7 @@ cgy_flag(cligen_yacc *cy,
             }
         }
         if ((cv = cvec_add(cy->cy_cvec, CGV_INT32)) == NULL){
-            fprintf(stderr, "%s: realloc:%s\n", __FUNCTION__, strerror(errno));
+            fprintf(stderr, "%s: cvec_add:%s\n", __FUNCTION__, strerror(errno));
             goto done;
         }
         cv_name_set(cv, var);
@@ -219,7 +293,7 @@ cgy_flag(cligen_yacc *cy,
  * I decided to create special syntax for this so that assignments can use any
  * variable names.
  * @param[in]  cy   CLIgen yacc parse struct
- * @param[in]  name Name of tree
+ * @param[in]  name Name of tree, can be NULL
  */
 static int
 cgy_treename(cligen_yacc *cy,
@@ -266,9 +340,11 @@ cgy_treename(cligen_yacc *cy,
         }
     }
     /* 4. Set the new name */
-    if (cy->cy_treename)
+    if (cy->cy_treename){
         free(cy->cy_treename);
-    if ((cy->cy_treename = strdup(name)) == NULL){
+        cy->cy_treename = NULL;
+    }
+    if (name && (cy->cy_treename = strdup(name)) == NULL){ // XXX
         fprintf(stderr, "%s: strdup: %s\n", __FUNCTION__, strerror(errno));
         goto done;
     }
@@ -281,6 +357,8 @@ cgy_treename(cligen_yacc *cy,
  *
  * Only string type supported for now
  * @param[in]  cy  CLIgen yacc parse struct
+ * @param[in]  var Variable name
+ * @param[in]  val Variable value
  */
 static int
 cgy_assignment(cligen_yacc *cy,
@@ -306,7 +384,7 @@ cgy_assignment(cligen_yacc *cy,
                 goto done;
             }
         if ((cv = cvec_add(cy->cy_cvec, CGV_STRING)) == NULL){
-            fprintf(stderr, "%s: realloc:%s\n", __FUNCTION__, strerror(errno));
+            fprintf(stderr, "%s: cvec_add:%s\n", __FUNCTION__, strerror(errno));
             goto done;
         }
         cv_name_set(cv, var);
@@ -322,7 +400,7 @@ cgy_assignment(cligen_yacc *cy,
         else {
             if ((cv = cvec_find(cy->cy_globals, var)) == NULL){
                 if ((cv = cvec_add(cy->cy_globals, CGV_STRING)) == NULL){
-                    fprintf(stderr, "%s: realloc:%s\n", __FUNCTION__, strerror(errno));
+                    fprintf(stderr, "%s: cvec_add:%s\n", __FUNCTION__, strerror(errno));
                     goto done;
                 }
                 cv_name_set(cv, var);
@@ -359,7 +437,11 @@ cgy_callback(cligen_yacc *cy,
         return -1;
     }
     memset(cc, 0, sizeof(*cc));
-    cc->cc_fn_str = cb_str;
+    if ((cc->cc_fn_str = strdup(cb_str)) == NULL){
+        fprintf(stderr, "%s: strdup: %s\n", __FUNCTION__, strerror(errno));
+        free(cc);
+        return -1;
+    }
     if (IS_PIPE_TREE(cy->cy_treename)){ /* Only for cligen, clixon has other mechanisms */
         cc->cc_flags |= CC_FLAGS_PIPE_FUNCTION;
     }
@@ -429,6 +511,8 @@ static int
 expand_fn(cligen_yacc *cy,
           char        *fn)
 {
+    if (cy->cy_var->co_expand_fn_str)
+        free(cy->cy_var->co_expand_fn_str);
     cy->cy_var->co_expand_fn_str = fn;
     return 0;
 }
@@ -437,6 +521,8 @@ static int
 cg_translate(cligen_yacc *cy,
              char        *fn)
 {
+    if (cy->cy_var->co_translate_fn_str)
+        free(cy->cy_var->co_translate_fn_str);
     cy->cy_var->co_translate_fn_str = fn;
     return 0;
 }
@@ -445,18 +531,23 @@ static int
 cg_preference(cligen_yacc *cy,
               char        *pref)
 {
+    int     retval = -1;
     cg_obj *yv;
     char   *reason = NULL;
 
     if ((yv = cy->cy_var) == NULL){
         fprintf(stderr, "No var obj");
-        return -1;
+        goto done;
     }
     if (parse_uint16(pref, &yv->co_preference, &reason) != 1){
         cligen_parseerror1(cy, reason);
-        return -1;
+        goto done;
     }
-    return 0;
+    retval = 0;
+ done:
+    if (reason)
+        free(reason);
+    return retval;
 }
 
 static int
@@ -532,7 +623,8 @@ cgy_var_name_type(cligen_yacc *cy,
                   char        *name,
                   char        *type)
 {
-    cy->cy_var->co_command = name;
+    if ((cy->cy_var->co_command = strdup(name)) == NULL)
+        return -1;
     if ((cy->cy_var->co_vtype = cv_str2type(type)) == CGV_ERR){
         cligen_parseerror1(cy, "Invalid type");
         fprintf(stderr, "%s: Invalid type: %s\n", __FUNCTION__, type);
@@ -583,6 +675,8 @@ cgy_var_post(cligen_yacc *cy)
         cl = cy->cy_list;
     for (; cl; cl = cl->cl_next){
         coparent = cl->cl_obj;
+        if (cgy_obj_count(cy) < 0)
+            return -1;
         if (cl->cl_next){
             if (co_copy(coy, coparent, 0x0, &coc) < 0) /* duplicate coy to coc */
                 return -1;
@@ -620,6 +714,8 @@ cgy_cmd(cligen_yacc *cy,
         if (debug)
             fprintf(stderr, "%s: %s parent:%s\n",
                     __FUNCTION__, cmd, cop->co_command);
+        if (cgy_obj_count(cy) < 0)
+            return -1;
         if ((conew = co_new(cmd, cop)) == NULL) {
             cligen_parseerror1(cy, "Allocating cligen object");
             return -1;
@@ -662,6 +758,8 @@ cgy_reference(cligen_yacc *cy,
     for (cl=cy->cy_list; cl; cl = cl->cl_next){
         /* Add a treeref 'stub' which is expanded in pt_expand to a sub-tree */
         cop = cl->cl_obj;
+        if (cgy_obj_count(cy) < 0)
+            goto done;
         if ((cot = co_new(cbuf_get(cb), cop)) == NULL) {
             cligen_parseerror1(cy, "Allocating cligen object");
             goto done;
@@ -707,13 +805,21 @@ cgy_helpstring(cligen_yacc *cy,
         co = cl->cl_obj;
         if (co->co_helpstring){
             if (merge){
-                if ((co->co_helpstring = realloc(co->co_helpstring,
-                                                 strlen(co->co_helpstring) + strlen(helpstr) + 2)) == NULL){
+                size_t  olen = strlen(co->co_helpstring);
+                size_t  alen = strlen(helpstr);
+                char   *tmp;
+
+                if (alen > SIZE_MAX - olen - 2){
+                    cligen_parseerror1(cy, "Allocating helpstr: size overflow");
+                    goto done;
+                }
+                if ((tmp = realloc(co->co_helpstring, olen + alen + 2)) == NULL){
                     cligen_parseerror1(cy, "Allocating helpstr");
                     goto done;
                 }
-                strcat(co->co_helpstring, "\n");
-                strcat(co->co_helpstring, helpstr);
+                co->co_helpstring = tmp;
+                tmp[olen] = '\n';
+                memcpy(tmp + olen + 1, helpstr, alen + 1);
             }
         }
         else
@@ -759,12 +865,20 @@ cgy_choicepair_append(cgy_choice_pair_t *pair,
     }
     else {
         nlen = strlen(pair->names) + 1 + strlen(name ? name : "") + 1;
+        if (nlen < strlen(pair->names)){
+            fprintf(stderr, "%s: names size overflow\n", __FUNCTION__);
+            return NULL;
+        }
         if ((names = realloc(pair->names, nlen)) == NULL){
             fprintf(stderr, "%s: realloc names: %s\n", __FUNCTION__, strerror(errno));
             return NULL;
         }
-        strcat(names, "|");
-        strcat(names, name ? name : "");
+        {
+            size_t pos = strlen(names);
+            const char *app = name ? name : "";
+            names[pos++] = '|';
+            memcpy(names + pos, app, strlen(app) + 1);
+        }
     }
     pair->names = names;
     /* Append help (always maintain parallel string, empty if no help) */
@@ -773,12 +887,20 @@ cgy_choicepair_append(cgy_choice_pair_t *pair,
     }
     else {
         hlen = strlen(pair->helps) + 1 + strlen(help ? help : "") + 1;
+        if (hlen < strlen(pair->helps)){
+            fprintf(stderr, "%s: helps size overflow\n", __FUNCTION__);
+            return NULL;
+        }
         if ((helps = realloc(pair->helps, hlen)) == NULL){
             fprintf(stderr, "%s: realloc helps: %s\n", __FUNCTION__, strerror(errno));
             return NULL;
         }
-        strcat(helps, "|");
-        strcat(helps, help ? help : "");
+        {
+            size_t pos = strlen(helps);
+            const char *app = help ? help : "";
+            helps[pos++] = '|';
+            memcpy(helps + pos, app, strlen(app) + 1);
+        }
     }
     pair->helps = helps;
     return pair;
@@ -837,6 +959,8 @@ cgy_terminal(cligen_yacc *cy)
                     break;
             }
             if (i == pt_len_get(ptc)){ /* Insert empty child if ';' */
+                if (cgy_obj_count(cy) < 0)
+                    return -1;
                 if ((coi = co_new(NULL, co)) == NULL) {
                     cligen_parseerror1(cy, "Allocating cligen object");
                     return -1;
@@ -875,16 +999,21 @@ static int
 ctx_push(cligen_yacc *cy,
          int          sets)
 {
+    int               retval = -1;
     struct cgy_list  *cl;
     struct cgy_stack *cs;
     cg_obj           *co;
 
     if (debug)
         fprintf(stderr, "%s\n", __FUNCTION__);
+    if (++cy->cy_stackdepth > CLIGEN_PARSE_MAX_DEPTH){
+        cligen_parseerror1(cy, "Nesting too deep: too many nested () [] {}");
+        goto done;
+    }
     /* Create new stack element */
     if ((cs = malloc(sizeof(*cs))) == NULL) {
         fprintf(stderr, "%s: malloc: %s\n", __FUNCTION__, strerror(errno));
-        return -1;
+        goto done;
     }
     memset(cs, 0, sizeof(*cs));
     cs->cs_next = cy->cy_stack;
@@ -896,9 +1025,11 @@ ctx_push(cligen_yacc *cy,
         if (sets)
             co_sets_set(co, 1);
         if (cgy_list_push(co, &cs->cs_list) < 0)
-            return -1;
+            goto done;
     }
-    return 0;
+    retval = 0;
+ done:
+    return retval;
 }
 
 /*! Peek context from stack and replace the object list with it
@@ -1005,6 +1136,8 @@ ctx_pop_add(cligen_yacc *cy)
         return -1; /* shouldnt happen */
     }
     cy->cy_stack = cs->cs_next;
+    if (cy->cy_stackdepth > 0)
+        cy->cy_stackdepth--;
     /* We could have saved some heap work by moving the cs_list,... */
     for (cl = cs->cs_list; cl; cl = cl->cl_next){
         co = cl->cl_obj;
@@ -1040,6 +1173,8 @@ ctx_pop(cligen_yacc *cy)
         return -1; /* shouldnt happen */
     }
     cy->cy_stack = cs->cs_next;
+    if (cy->cy_stackdepth > 0)
+        cy->cy_stackdepth--;
     for (cl = cs->cs_saved; cl; cl = cl->cl_next){
         co = cl->cl_obj;
         if (cgy_list_push(co, &cy->cy_list) < 0)
@@ -1122,7 +1257,6 @@ cg_range_create(cligen_yacc *cy,
         }
         if (cvret == 0){ /* parsing failed */
             cligen_parseerror1(cy, reason);
-            free(reason);
             goto done;
         }
     }
@@ -1150,10 +1284,8 @@ cg_range_create(cligen_yacc *cy,
     }
     if (cvret == 0){ /* parsing failed */
         cligen_parseerror1(cy, reason);
-        free(reason);
         goto done;
     }
-
     /* Append it to the upper bound cvec, create if NULL */
     if (yv->co_rangecvv_upp == NULL){
         if ((yv->co_rangecvv_upp = cvec_from_var(cv2)) == NULL)
@@ -1165,6 +1297,8 @@ cg_range_create(cligen_yacc *cy,
     yv->co_rangelen++;
     retval = 0;
   done:
+    if (reason)
+        free(reason);
     if (cv1)
         cv_free(cv1);
     if (cv2)
@@ -1223,22 +1357,27 @@ cg_range(cligen_yacc *cy,
 /*!
  * @param[in]  cy  CLIgen yacc parse struct
  */
- static int
+static int
 cg_dec64_n(cligen_yacc *cy,
            char        *fraction_digits)
 {
+    int     retval = -1;
     cg_obj *yv;
     char   *reason = NULL;
 
     if ((yv = cy->cy_var) == NULL){
         fprintf(stderr, "No var obj");
-        return -1;
+        goto done;
     }
-    if (parse_uint8(fraction_digits, &yv->co_dec64_n, NULL) != 1){
+    if (parse_uint8(fraction_digits, &yv->co_dec64_n, &reason) != 1){
         cligen_parseerror1(cy, reason);
-        return -1;
+        goto done;
     }
-    return 0;
+    retval = 0;
+ done:
+    if (reason)
+        free(reason);
+    return retval;
 }
 
 /*!
@@ -1269,9 +1408,17 @@ cgy_exit(cligen_yacc *cy)
     if (debug)
         fprintf(stderr, "%s\n", __FUNCTION__);
 
-    cy->cy_var = NULL;
+    if (cy->cy_var) {
+        co_free(cy->cy_var, 1);
+        cy->cy_var = NULL;
+    }
+    if (cy->cy_cvec) {
+        cvec_free(cy->cy_cvec);
+        cy->cy_cvec = NULL;
+    }
     cgy_list_delete(&cy->cy_list);
-    if((cs = cy->cy_stack) != NULL){
+    while ((cs = cy->cy_stack) != NULL){
+        cy->cy_stack = cs->cs_next;
         delete_stack_element(cs);
 #if 0
         fprintf(stderr, "%s:%d: error: lacking () or [] at or before: '%s'\n",
@@ -1281,6 +1428,10 @@ cgy_exit(cligen_yacc *cy)
             );
         return -1;
 #endif
+    }
+    if (cy->cy_callbacks){
+        co_callbacks_free(&cy->cy_callbacks);
+        cy->cy_callbacks = NULL;
     }
     return 0;
 }
@@ -1356,7 +1507,7 @@ flag        : NAME               { _PARSE_DEBUG("flag->NAME");
 
 callback    : NAME               { _PARSE_DEBUG("callback->NAME ( arglist )");
                                    if (cgy_callback(_cy, $1) < 0) _YYERROR("callback");}
-              '(' arglist ')'
+              '(' arglist ')' { free($1); }
             ;
 
 arglist     : arglist1
@@ -1368,7 +1519,7 @@ arglist1    : arglist1 ',' arg
             ;
 
 arg         : typecast arg1 {
-                    if ($2 && cgy_callback_arg(_cy, $1, $2) < 0) _YYERROR("arg");
+                    if ($2 && cgy_callback_arg(_cy, $1, $2) < 0) { if ($1 != NULL) free($1); if ($2 != NULL) free($2); _YYERROR("arg"); }
                     if ($1 != NULL) free($1);
                     if ($2 != NULL) free($2);
               }
@@ -1428,7 +1579,7 @@ helpstring1 : helpstring1 HELPSTR
                   size_t len = strlen($1);
                   _PARSE_DEBUG("helpstring1 -> helpstring1 HELPSTR");
                   if (($$ = realloc($1, len+strlen($2) +1)) == NULL) _YYERROR("cmd");
-                  sprintf($$+len, "%s", $2);
+                  memcpy($$+len, $2, strlen($2)+1);
               }
             | HELPSTR
                {
@@ -1438,21 +1589,21 @@ helpstring1 : helpstring1 HELPSTR
             ;
 
 cmd         : NAME           { _PARSE_DEBUG("cmd->NAME");
-                               if (cgy_cmd(_cy, $1) < 0) _YYERROR("cmd"); free($1); }
+                               if (cgy_cmd(_cy, $1) < 0) { free($1); _YYERROR("cmd"); } free($1); }
             | '@' NAME       { _PARSE_DEBUG("cmd->@NAME");
-                               if (cgy_reference(_cy, $2, 0) < 0) _YYERROR("cmd"); free($2); }
+                               if (cgy_reference(_cy, $2, 0) < 0) { free($2); _YYERROR("cmd"); } free($2); }
             | '@' '|' NAME   { _PARSE_DEBUG("cmd->@|NAME");
-                               if (cgy_reference(_cy, $3, 1) < 0) _YYERROR("cmd"); free($3); }
+                               if (cgy_reference(_cy, $3, 1) < 0) { free($3); _YYERROR("cmd"); } free($3); }
             | '<'            { if ((_CY->cy_var = cgy_var_create(_CY)) == NULL) _YYERROR("cmd"); }
-               variable '>'  { if (cgy_var_post(_cy) < 0) _YYERROR("cmd"); }
+               variable '>'  { if (cgy_var_post(_cy) < 0) _YYERROR("cmd"); _CY->cy_var = NULL; }
             ;
 
-variable    : NAME          { if (cgy_var_name_type(_cy, $1, $1)<0) _YYERROR("variable"); }
-            | NAME ':' NAME { if (cgy_var_name_type(_cy, $1, $3)<0) _YYERROR("variable"); free($3); }
-            | NAME  { if (cgy_var_name_type(_cy, $1, $1) < 0) _YYERROR("variable"); }
-              keypairs
-            | NAME ':' NAME  { if (cgy_var_name_type(_cy, $1, $3) < 0) _YYERROR("variable"); free($3); }
-              keypairs
+variable    : vartype
+            | vartype keypairs
+            ;
+
+vartype     : NAME          { if (cgy_var_name_type(_cy, $1, $1) < 0) { free($1); _YYERROR("variable"); } free($1); }
+            | NAME ':' NAME { if (cgy_var_name_type(_cy, $1, $3) < 0) { free($1); free($3); _YYERROR("variable"); } free($1); free($3); }
             ;
 
 keypairs    : keypair {
@@ -1464,7 +1615,7 @@ keypairs    : keypair {
             ;
 
 numdec      : NUMBER { $$ = $1; }
-            | DECIMAL
+            | DECIMAL { $$ = $1; }
             ;
 
 keypair     : NAME '(' ')' {
@@ -1476,31 +1627,33 @@ keypair     : NAME '(' ')' {
                  expand_fn(_cy, $1); }
             | V_SHOW ':' NAME {
                  _PARSE_DEBUG("keypair->show:name");
+                 if (_CY->cy_var->co_show) free(_CY->cy_var->co_show);
                  _CY->cy_var->co_show = $3;
               }
             | V_SHOW ':' DQ charseq DQ {
                  _PARSE_DEBUG("keypair->show:DQ charseq DQ");
+                 if (_CY->cy_var->co_show) free(_CY->cy_var->co_show);
                  _CY->cy_var->co_show = $4;
               }
             | V_RANGE '[' numdec ':' numdec ']' {
                  _PARSE_DEBUG("keypair->range [<nr>:<nr>]");
-                if (cg_range(_cy, $3, $5) < 0) _YYERROR("keypair"); free($3); free($5);
+                 if (cg_range(_cy, $3, $5) < 0){ free($3); free($5);_YYERROR("keypair");} free($3); free($5);
               }
             | V_RANGE '[' numdec ']' {
                  _PARSE_DEBUG("keypair->range [<nr>]");
-                 if (cg_range(_cy, NULL, $3) < 0) _YYERROR("keypair"); free($3);
+                 if (cg_range(_cy, NULL, $3) < 0) {free($3);_YYERROR("keypair");} free($3);
               }
             | V_LENGTH '[' NUMBER ':' NUMBER ']' {
                  _PARSE_DEBUG("keypair->length[number:number]");
-                 if (cg_length(_cy, $3, $5) < 0) _YYERROR("keypair"); free($3); free($5);
+                 if (cg_length(_cy, $3, $5) < 0) { free($3); free($5);_YYERROR("keypair");} free($3); free($5);
               }
             | V_LENGTH '[' NUMBER ']' {
                  _PARSE_DEBUG("keypair->length[number]");
-                 if (cg_length(_cy, NULL, $3) < 0) _YYERROR("keypair"); free($3);
+                 if (cg_length(_cy, NULL, $3) < 0){free($3); _YYERROR("keypair");} free($3);
               }
             | V_FRACTION_DIGITS ':' NUMBER {
                  _PARSE_DEBUG("keypair->fraction-digits:number");
-                if (cg_dec64_n(_cy, $3) < 0) _YYERROR("keypair"); free($3);
+                 if (cg_dec64_n(_cy, $3) < 0) {free($3);_YYERROR("keypair")} free($3);
               }
             | V_CHOICE choices {
                  _PARSE_DEBUG("keypair->choice choices");
@@ -1518,11 +1671,11 @@ keypair     : NAME '(' ')' {
               }
             | V_REGEXP  ':' DQ charseq DQ {
                  _PARSE_DEBUG("keypair->regexp : DQ charseq DQ");
-                 if (cg_regexp(_cy, $4, 0) < 0) _YYERROR("keypair"); free($4);
+                 if (cg_regexp(_cy, $4, 0) < 0) {free($4);_YYERROR("keypair")} free($4);
               }
             | V_REGEXP  ':' '!'  DQ charseq DQ {
                  _PARSE_DEBUG("keypair->regexp : ! DQ charseq DQ");
-                 if (cg_regexp(_cy, $5, 1) < 0) _YYERROR("keypair"); free($5);
+                 if (cg_regexp(_cy, $5, 1) < 0) {free($5);_YYERROR("keypair")} free($5);
               }
             | V_TRANSLATE ':' NAME '(' ')' {
                  _PARSE_DEBUG("keypair->translate : name ()");
@@ -1540,12 +1693,15 @@ exparglist : exparglist ',' exparg
 
 exparg     : DQ DQ
            | DQ charseq DQ { expand_arg(_cy, $2); free($2); }
-           ;
-
-exparg     : typecast arg1 {
-                    if ($2 && cgy_callback_arg(_cy, $1, $2) < 0) _YYERROR("exparg");
-                    if ($1) free($1);
-                    if ($2) free($2);
+           | NAME {
+                    /* Bare arg (empty typecast): equivalent to the former
+                       "typecast arg1" branch with typecast==NULL, arg1==NAME. */
+                    if (cgy_callback_arg(_cy, NULL, $1) < 0) { free($1); _YYERROR("exparg"); }
+                    free($1);
+              }
+           | '(' NAME ')' arg1 {
+                    if ($4 && cgy_callback_arg(_cy, $2, $4) < 0) { free($2); if ($4) free($4); _YYERROR("exparg"); }
+                    free($2); if ($4) free($4);
               }
            ;
 
@@ -1560,7 +1716,7 @@ choices    : choice { $$ = $1; }
              }
            ;
 
-choice     : { $$ = NULL; }
+choice     :  { $$ = NULL; }
            | NUMBER choicehelp {
                  $$ = (void *)cgy_choicepair_append(NULL, $1, $2);
                  free($1); if ($2) free($2);
@@ -1580,6 +1736,7 @@ choice     : { $$ = NULL; }
 
 choicehelp : /* empty */ { $$ = NULL; }
            | '(' DQ charseq DQ ')' { $$ = $3; }
+           | '(' DQ DQ ')'         { $$ = NULL; }
            ;
 
 charseq    : charseq CHARS
@@ -1587,7 +1744,7 @@ charseq    : charseq CHARS
                   int len = strlen($1);
                   _PARSE_DEBUG("charseq->charseq CHARS");
                   $$ = realloc($1, len+strlen($2) +1);
-                  sprintf($$+len, "%s", $2);
+                  memcpy($$+len, $2, strlen($2)+1);
                   free($2);
                  }
            | CHARS {_PARSE_DEBUG("charseq->CHARS");

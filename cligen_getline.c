@@ -163,6 +163,7 @@ struct termio   new_termio, old_termio;
 #include <descrip.h>
 #include <ttdef.h>
 #include <iodef.h>
+#include "banned.h"
 #include unixio
 
 static int   setbuff[2];             /* buffer to set terminal attributes */
@@ -317,9 +318,18 @@ gl_unregfd(int fd)
     for (i = 0; i < nextfds; i++) {
         if (extfds[i].fd == fd) {
             if (i+1 < nextfds)
-                memcpy(&extfds[i], &extfds[i+1], nextfds-i);
-            extfds = realloc(extfds, (nextfds-1) * sizeof(*extfds));
+                memmove(&extfds[i], &extfds[i+1], (nextfds-i-1) * sizeof(*extfds));
             nextfds--;
+            if (nextfds == 0){
+                free(extfds);
+                extfds = NULL;
+            }
+            else {
+                struct regfd *tmp;
+                /* Shrink; if realloc fails keep the larger buffer (still valid) */
+                if ((tmp = realloc(extfds, nextfds * sizeof(*extfds))) != NULL)
+                    extfds = tmp;
+            }
             return 0;
         }
     }
@@ -1094,7 +1104,7 @@ move_cursor_right(int nr)
 
     gl_putc(033);
     gl_putc('[');
-    snprintf(str, 15, "%d", nr);
+    snprintf(str, sizeof(str), "%d", nr);
     len = strlen(str);
     for (i=0; i<len; i++)
         gl_putc(str[i]);
@@ -1189,6 +1199,7 @@ gl_fixup_noscroll(cligen_handle h,
         gl_putc('\r');
         gl_puts(prompt);
         strncpy(fixup_last_prompt, prompt, sizeof(fixup_last_prompt)-1);
+        fixup_last_prompt[sizeof(fixup_last_prompt)-1] = '\0';
         change = 0;
         gl_width = gl_termw - gl_strlen(prompt);
     } else if (strcmp(prompt, fixup_last_prompt) != 0) {
@@ -1196,6 +1207,7 @@ gl_fixup_noscroll(cligen_handle h,
         l2 = gl_strlen(prompt);
         gl_cnt = gl_cnt + l1 - l2;
         strncpy(fixup_last_prompt, prompt, sizeof(fixup_last_prompt)-1);
+        fixup_last_prompt[sizeof(fixup_last_prompt)-1] = '\0';
         gl_putc('\r');
         gl_puts(prompt);
         gl_pos = fixup_gl_shift;
@@ -1303,6 +1315,7 @@ gl_fixup_scroll(cligen_handle h,
         gl_putc('\r');
         gl_puts(prompt);
         strncpy(fixup_last_prompt, prompt, sizeof(fixup_last_prompt)-1);
+        fixup_last_prompt[sizeof(fixup_last_prompt)-1] = '\0';
         change = 0;
         gl_width = gl_termw - gl_strlen(prompt);
     } else if (strcmp(prompt, fixup_last_prompt) != 0) {
@@ -1310,6 +1323,7 @@ gl_fixup_scroll(cligen_handle h,
         l2 = gl_strlen(prompt);
         gl_cnt = gl_cnt + l1 - l2;
         strncpy(fixup_last_prompt, prompt, sizeof(fixup_last_prompt)-1);
+        fixup_last_prompt[sizeof(fixup_last_prompt)-1] = '\0';
         gl_putc('\r');
         gl_puts(prompt);
         gl_pos = fixup_gl_shift;

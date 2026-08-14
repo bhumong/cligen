@@ -68,6 +68,7 @@
 #include "cligen_parse.h"
 #include "cligen_handle.h"
 #include "cligen_getline.h"
+#include "banned.h"
 
 /* Stats: nr of created cligen objects */
 uint64_t _co_created = 0;
@@ -583,8 +584,10 @@ co_new(const char *cmd,
 
     if ((co = co_new_only(CO_COMMAND)) == NULL)
         return NULL;
-    if (cmd)
-        co->co_command = strdup(cmd);
+    if (cmd && (co->co_command = strdup(cmd)) == NULL){
+        free(co);
+        return NULL;
+    }
     co_up_set(co, parent);
     /* parse-tree created implicitly */
     if ((pt = pt_new()) == NULL){

@@ -73,6 +73,7 @@
 #include "cligen_print.h"
 #include "cligen_expand.h"
 #include "cligen_syntax.h"
+#include "banned.h"
 
 /*! Copy and expand a cligen object.
  *
@@ -339,14 +340,16 @@ co_find_label_filters(cligen_handle h,
 
 /*! Make a pt expand of single co using shallow copy
  *
- * @param[in]   h          Handle needed to resolve tree-references (\@tree)
- * @param[in]   co0        Reference object, @tree
- * @param[in]   cvv_filter Add these to expanded nodes co_filter, eg remove them
- * @param[in]   cvt        Tokenized string: vector of tokens
- * @param[in]   ptorig     Original parsetree
- * @param[out]  ptnew      Expanded parse-tree to expand. In: original, out: expanded
- * @retval      0          OK
- * @retval     -1          Error
+ * @param[in]   h             Handle needed to resolve tree-references (\@tree)
+ * @param[in]   co0           Reference object, @tree
+ * @param[in]   coparent_in   If non-NULL, override co_up(co0) as parent for copies
+ * @param[in]   cvv_filter    Add these to expanded nodes co_filter, eg remove them
+ * @param[in]   cvt           Tokenized string: vector of tokens
+ * @param[in]   ptorig        Original parsetree
+ * @param[in]   inherit_flags Flags propagated from outer expansion; OR-ed onto all copies
+ * @param[out]  ptnew         Expanded parse-tree to expand. In: original, out: expanded
+ * @retval      0             OK
+ * @retval     -1             Error
  * Makes recursive unfolding of tree references which means it handles eg:
  * @a
  * a:
@@ -356,10 +359,13 @@ co_find_label_filters(cligen_handle h,
 static int
 co_expand_treeref_copy_shallow(cligen_handle h,
                                cg_obj       *co0,
+                               cg_obj       *coparent_in,
                                cvec         *cvv_filter,
                                cvec         *cvt,
                                parse_tree   *ptorig,
+                               uint32_t      inherit_flags,
                                parse_tree   *ptnew)
+
 {
     int         retval = -1;
     cg_obj     *coparent;
@@ -374,7 +380,7 @@ co_expand_treeref_copy_shallow(cligen_handle h,
         errno = EINVAL;
         goto done;
     }
-    coparent = co_up(co0);
+    coparent = coparent_in != NULL ? coparent_in : co_up(co0);
     for (i=0; i<pt_len_get(ptorig); i++){
         if ((cot = pt_vec_i_get(ptorig, i)) == NULL)
             continue;
@@ -396,8 +402,24 @@ co_expand_treeref_copy_shallow(cligen_handle h,
                 if (cvec_append_var(cvv, cv) == NULL)
                     goto done;
             }
-            if (co_expand_treeref_copy_shallow(h, co0, cvv, cvt, ptref2, ptnew) < 0)
-                goto done;
+            {
+                /* Ask the application callback what flags to propagate into this
+                 * nested tree expansion.  If no callback is registered the flags
+                 * are inherited unchanged.
+                 * co0 is kept (not cot) so co_ref on copies points to the outer
+                 * CO_REFERENCE, preserving workpoint/edit tracking.
+                 * co_up(cot) is passed as explicit parent so copies get the correct
+                 * ancestor as their co_up. */
+                cligen_treeref_flags_fn *flags_fn = NULL;
+                uint32_t                 new_flags = inherit_flags;
+                cligen_treeref_flags_fn_get(h, &flags_fn);
+                if (flags_fn != NULL){
+                    if (flags_fn(h, cot->co_command, inherit_flags, &new_flags) < 0)
+                        goto done;
+                }
+                if (co_expand_treeref_copy_shallow(h, co0, co_up(cot), cvv, cvt, ptref2, new_flags, ptnew) < 0)
+                    goto done;
+            }
             cvec_free(cvv);
             cvv = NULL;
         }
@@ -410,6 +432,9 @@ co_expand_treeref_copy_shallow(cligen_handle h,
             con->co_ref = co0;
             co_flags_set(con, CO_FLAGS_TOPOFTREE); /* Mark expanded refd tree */
             con->co_treeref_orig = cot;
+            /* Propagate application-defined flags from the enclosing expansion */
+            if (inherit_flags)
+                co_flags_set(con, inherit_flags);
             if (cvec_len(cvv_filter) &&
                 co_filter_set(con, cvv_filter) == NULL)
                 goto done;
@@ -497,6 +522,10 @@ cligen_escape_do(const char *s0)
     }
     len = strlen(s0);
     nr = cligen_escape_nr(s0);
+    if (len > SIZE_MAX - (size_t)nr - 1){
+        errno = EOVERFLOW;
+        return NULL;
+    }
     if ((s1 = (char*)malloc(len + 1 + nr)) == NULL){
         return NULL;
     }
@@ -658,22 +687,31 @@ pt_expand_choice(cg_obj       *co,
     int     retval = -1;
     char   *ccmd;
     char   *cp = NULL;
+    char   *cp_help = NULL;
     char   *c;
+    char   *cdup;
     cg_obj *con = NULL;
     char   *helptext;
 
     /* parse co_choice and get alternatives, with optional parallel help texts in co_choice_help */
     if (co->co_choice){
         char *helps = co->co_choice_help;   /* parallel '|'-separated helptexts, may be NULL */
-        char *cp_help = helps ? strdup(helps) : NULL;
+        if (helps && (cp_help = strdup(helps)) == NULL)
+            goto done;
         char *hcmd = cp_help;
-        cp = ccmd = strdup(co->co_choice);
+        if ((cp = strdup(co->co_choice)) == NULL)
+            goto done;
+        ccmd = cp;
         while ((c = strsep(&ccmd, ",|")) != NULL){
             char *h = hcmd ? strsep(&hcmd, "|") : NULL;
-            helptext = (h && *h) ? strdup(h) : NULL;
+            helptext = NULL;
+            if (h && *h && (helptext = strdup(h)) == NULL)
+                goto done;
             if (co_expand_sub(co, NULL, &con) < 0)
                 goto done;
-            if (transform_var_to_cmd(con, strdup(c), helptext) < 0)
+            if ((cdup = strdup(c)) == NULL)
+                goto done;
+            if (transform_var_to_cmd(con, cdup, helptext) < 0)
                 goto done;
             if (cvv_filter && co_filter_set(con, cvv_filter) == NULL)
                 goto done;
@@ -682,11 +720,11 @@ pt_expand_choice(cg_obj       *co,
                 goto done;
             con = NULL;
         }
-        if (cp_help)
-            free(cp_help);
     }
     retval = 0;
  done:
+    if (cp_help)
+        free(cp_help);
     if (con)
         co_free(con, 0);
     if (cp)
@@ -737,6 +775,42 @@ co_filter_bool(cvec       *cvv_filter,
     return 0;
 }
 
+/*! User-defined node filter callback: allows callers (e.g. NACM) to exclude nodes
+ *
+ * @param[in]  h               Cligen handle
+ * @param[in]  co              CLIgen object to check
+ * @param[in]  cvv_var         Cligen variable vector containing vars/values pair for completion
+ * @param[in]  node_filter_arg User-defined argument for node filter callback
+ * @param[out] skip            Set to 1 if node should be skipped, else 0
+ * @retval     0               OK
+ * @retval    -1               Error
+ */
+static int
+node_callbacks(cligen_handle h,
+              cg_obj       *co,
+              cvec         *cvv_var)
+{
+    int                    retval = -1;
+    cligen_node_filter_fn *node_filter_fn = NULL;
+    void                  *node_filter_arg = NULL;
+    int                    skip = 0;
+
+    if (cligen_node_filter_get(h, &node_filter_fn, &node_filter_arg) < 0)
+        goto done;
+    if (node_filter_fn != NULL){
+        if (node_filter_fn(h, co, cvv_var, node_filter_arg, &skip) < 0)
+            goto done;
+        if (skip)
+            goto ok;
+    }
+    retval = 1;
+ done:
+    return retval;
+ ok:
+    retval = 0;
+    goto done;
+}
+
 /*! pt_expand function for expanding children to parse-tree
  *
  * @param[in]     h          Cligen handle
@@ -766,6 +840,7 @@ pt_expand1_co(cligen_handle h,
     cg_var *cv;
     cg_obj *con = NULL;
     char   *label;
+    int     ret;
 
     if (co_value_set(co, NULL) < 0)
         goto done;
@@ -782,6 +857,10 @@ pt_expand1_co(cligen_handle h,
             break;
     }
     if (cv) /* found: break in the while loop ^ */
+        goto ok;
+    if ((ret = node_callbacks(h, co, cvv_var)) < 0)
+        goto done;
+    if (ret == 0)
         goto ok;
     /*
      * Choice variable - Insert the static choices as commands in place
@@ -902,9 +981,20 @@ pt_expand_reference(cligen_handle h,
         goto done;
     if (co_find_label_filters(h, coref, cvv2) < 0)
         goto done;
-    /* Expand ptref to pttmp */
-    if (co_expand_treeref_copy_shallow(h, coref, cvv2, cvv_var, ptref, pttmp) < 0)
-        goto done;
+    /* Expand ptref to pttmp.
+     * Ask the application callback what flags to apply to all copies from this
+     * top-level tree reference.  With no callback, no flags are set. */
+    {
+        cligen_treeref_flags_fn *flags_fn = NULL;
+        uint32_t                 flags = 0;
+        cligen_treeref_flags_fn_get(h, &flags_fn);
+        if (flags_fn != NULL){
+            if (flags_fn(h, coref->co_command, 0, &flags) < 0)
+                goto done;
+        }
+        if (co_expand_treeref_copy_shallow(h, coref, NULL, cvv2, cvv_var, ptref, flags, pttmp) < 0)
+            goto done;
+    }
     /* Copy the expand tree to the final tree.
      */
     for (i=0; i<pt_len_get(pttmp); i++){

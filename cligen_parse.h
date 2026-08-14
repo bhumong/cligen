@@ -41,6 +41,10 @@
 /*
  * Types
  */
+#ifndef YY_TYPEDEF_YY_SCANNER_T
+#define YY_TYPEDEF_YY_SCANNER_T
+typedef void *yyscan_t;
+#endif
 
 /*
  * Two data structures: a list and a stack.
@@ -68,6 +72,7 @@ struct cligen_parse_yacc{
     int                   cy_linenum;      /* Number of \n in parsed buffer */
     const char           *cy_parse_string; /* original (copy of) parse string */
     void                 *cy_lexbuf;       /* internal parse buffer from lex */
+    yyscan_t              cy_scanner;      /* reentrant flex scanner handle */
     cvec                 *cy_globals;      /* global variables after parsing */
     cvec                 *cy_cvec;         /* local variables (per-command) */
     struct cgy_stack     *cy_stack;        /* Stack of levels: push/pop on () and [] */
@@ -79,13 +84,20 @@ struct cligen_parse_yacc{
     int                   cy_optional;     /* Keep track of [] level, 0..n. All co objects
                                             * created when this flag > 0 will have
                                             * CO_FLAGS_OPTION set */
+    int                   cy_co_count;     /* Number of parse-tree objects created in this
+                                            * parse. Guards against pathological specs whose
+                                            * choice/tail expansion is exponential. */
+    int                   cy_stackdepth;   /* Current ()/[]/{} nesting depth. Guards against
+                                            * excessively deep nesting. */
 };
 typedef struct cligen_parse_yacc cligen_yacc;
 
 /*
  * Variables
  */
-extern char *cligen_parsetext;
+
+/* Forward declaration of YYSTYPE for cligen_parselex prototype */
+union YYSTYPE;
 
 /*
  * Prototypes
@@ -97,9 +109,9 @@ int cgl_exit(cligen_yacc *cy);
 int cgy_init(cligen_yacc *cy, cg_obj *co_top);
 int cgy_exit(cligen_yacc *cy);
 
-int cligen_parselex(void *_ya);
-int cligen_parseparse(void *);
-void cligen_parseerror(void *_ya, char*);
+int cligen_parselex(union YYSTYPE *yylval, yyscan_t yyscanner);
+int cligen_parseparse(void *, yyscan_t);
+void cligen_parseerror(void *_ya, yyscan_t yyscanner, const char*);
 int cligen_parse_debug(int d);
 
 #endif  /* _CLIGEN_PARSE_H_ */

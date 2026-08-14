@@ -95,12 +95,12 @@ enum cg_objtype{
            1 if did not handle expand
           -1 on error.
 */
-typedef int (expand_cb)(cligen_handle h,       /* handler: cligen or userhandle */
-                        char         *name,    /* name of this function (in text) */
-                        cvec         *cvv,     /* vars vector of values in command */
-                        cvec         *argv,    /* argument vector given to callback */
-                        cvec         *commands,/* vector of commands */
-                        cvec         *helptexts /* vector of help-texts */
+typedef int (expand_cb)(cligen_handle h,             /* handler: cligen or userhandle */
+                        const char   *name,          /* name of this function (in text) */
+                        cvec         *cvv,           /* vars vector of values in command */
+                        cvec         *argv,          /* argument vector given to callback */
+                        cvec         *commands,      /* vector of commands */
+                        cvec         *helptexts      /* vector of help-texts */
                         );
 
 #if 1  // XXX backward-compatible
@@ -167,6 +167,7 @@ typedef struct cg_varspec cg_varspec;
 #define CO_FLAGS_OPTION    0x08  /* Generated from optional [] */
 #define CO_FLAGS_MATCH     0x10  /* For sets: avoid selecting same more than once */
 #define CO_FLAGS_ALIAS     0x20  /* Added as an alias (see cligen_alias_cb) */
+#define CO_FLAGS_TREEREF   0x40  /* Set by application treeref-flags callback; propagated to all copies within a tagged expansion */
 
 /* Flags for pt_copy and co_copy
  */

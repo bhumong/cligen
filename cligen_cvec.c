@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 #include <inttypes.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -64,6 +65,17 @@
 
 #include "cligen_cv_internal.h"
 #include "cligen_cvec_internal.h"
+#include "banned.h"
+
+/*
+ * Constants
+ */
+/* Initial number of elements allocated for a cvec's vector on first growth, then
+ * it grows exponentially (2*, 4*, ...) until CVECLEN_THRESHOLD, thereafter it
+ * grows linearly. @see cvec_realloc, and cbuf_realloc for the analogous cbuf logic.
+ */
+#define CVECLEN_START     1
+#define CVECLEN_THRESHOLD 1024
 
 /*! A malloc version that aligns on 4 bytes. To avoid warning from valgrind */
 #define align4(s) (((s)/4)*4 + 4)
@@ -71,13 +83,17 @@
 /*! A strdup version that aligns on 4 bytes. To avoid warning from valgrind */
 static inline char * strdup4(const char *str)
 {
-    char *dup;
-    int len;
+    char  *dup;
+    size_t slen;
+    size_t len;
 
-    len = align4(strlen(str)+1);
+    slen = strlen(str) + 1;        /* valid source bytes incl NUL */
+    len  = align4(slen);           /* allocation rounded up to 4 (valgrind) */
     if ((dup = malloc(len)) == NULL)
         return NULL;
-    strcpy(dup, str);
+    memcpy(dup, str, slen);        /* copy only valid bytes, no source over-read */
+    if (len > slen)
+        memset(dup + slen, 0, len - slen); /* zero padding to stay valgrind-clean */
     return dup;
 }
 
@@ -154,8 +170,12 @@ cvec_init(cvec *cvv,
           int   len)
 {
     cvv->vr_len = len;
-    if (len && (cvv->vr_vec = calloc(cvv->vr_len, sizeof(cg_var))) == NULL)
+    cvv->vr_cap = len;
+    if (len && (cvv->vr_vec = calloc(cvv->vr_len, sizeof(cg_var))) == NULL){
+        cvv->vr_len = 0;
+        cvv->vr_cap = 0;
         return -1;
+    }
     return 0;
 }
 
@@ -206,6 +226,56 @@ cvec_next(cvec   *cvv,
     return cv;
 }
 
+/*! Ensure a cligen variable vector has capacity for at least 'needed' elements.
+ *
+ * Uses exponential (doubling) growth up to a threshold, then linear growth.
+ * This decouples allocated capacity (vr_cap) from the
+ * used length (vr_len), so building a vector with N incremental cvec_add() calls
+ * costs amortized O(N) reallocations instead of O(N).
+ * @param[in] cvv     Cligen variable vector
+ * @param[in] needed  Required number of elements
+ * @retval    0       OK (capacity now >= needed)
+ * @retval   -1       Error (errno set)
+ * @see cbuf_realloc  Analogous cligen-buffer reallocator
+ */
+static int
+cvec_realloc(cvec *cvv,
+             int   needed)
+{
+    int     retval = -1;
+    int     cap;
+    cg_var *tmp;
+
+    if (needed <= cvv->vr_cap)
+        return 0;                       /* Already large enough */
+    cap = cvv->vr_cap;
+    if (cap < CVECLEN_START)
+        cap = CVECLEN_START;
+    while (cap < needed){
+        if (CVECLEN_THRESHOLD == 0 || cap < CVECLEN_THRESHOLD){
+            if (cap > INT_MAX/2){       /* Overflow guard */
+                errno = ENOMEM;
+                goto done;
+            }
+            cap *= 2;                   /* Double the space - exponential */
+        }
+        else {
+            if (cap > INT_MAX - CVECLEN_THRESHOLD){
+                errno = ENOMEM;
+                goto done;
+            }
+            cap += CVECLEN_THRESHOLD;   /* Add - linear growth */
+        }
+    }
+    if ((tmp = realloc(cvv->vr_vec, (size_t)cap*sizeof(cg_var))) == NULL)
+        goto done;
+    cvv->vr_vec = tmp;
+    cvv->vr_cap = cap;
+    retval = 0;
+ done:
+    return retval;
+}
+
 /*! Append a new cligen variable (cv) to cligen variable vector (cvec) and return it.
  *
  * @param[in] cvv   Cligen variable vector
@@ -228,7 +298,7 @@ cvec_add(cvec        *cvv,
         return NULL;
     }
     len = cvv->vr_len + 1;
-    if ((cvv->vr_vec = realloc(cvv->vr_vec, len*sizeof(cg_var))) == NULL)
+    if (cvec_realloc(cvv, len) < 0)
         return NULL;
     cvv->vr_len = len;
     cv = cvec_i(cvv, len-1);
@@ -296,7 +366,13 @@ cvec_del(cvec   *cvv,
                 (cvv->vr_len-i-1) * sizeof(cvv->vr_vec[0]));
 
     cvv->vr_len--;
-    cvv->vr_vec = realloc(cvv->vr_vec, cvv->vr_len*sizeof(cvv->vr_vec[0])); /* Shrink should not fail? */
+    if (cvv->vr_len == 0){
+        free(cvv->vr_vec);
+        cvv->vr_vec = NULL;
+        cvv->vr_cap = 0;
+    }
+    /* else: keep the allocated capacity (no shrink) to avoid realloc churn;
+     * memory is released on cvec_reset/cvec_free or when it becomes empty */
 
     return cvec_len(cvv);
 }
@@ -318,7 +394,7 @@ int
 cvec_del_i(cvec *cvv,
            int   i)
 {
-    if (cvec_len(cvv) == 0 || cvec_len(cvv) < i){
+    if (cvec_len(cvv) == 0 || cvec_len(cvv) <= i){
         errno = EINVAL;
         return -1;
     }

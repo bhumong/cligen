@@ -1,6 +1,7 @@
-# Cligen Changelog
+# CLIgen Changelog
 
-* [7.8.0](#780) Expected: May 2026
+* [7.9.0](#790) Expected: September 2026
+* [7.8.0](#780) 29 May 2026
 * [7.7.0](#770) 21 February 2026
 * [7.6.0](#760) 21 November 2025
 * [7.5.0](#750) 29 July 2025
@@ -16,13 +17,37 @@
 * [6.1.0](#610) 19 Feb 2023
 * [6.0.0](#600) 29 Nov 2022
 
-## 7.8.0
-Expected: May 2026
+## 7.9.0
+Expected: September 2026
 
 ### Features
 
+* Optimized cvec_add using exponential growth instead of linear up to a threshold
+* Added guards against pathological specs causing exponential growth
+  * Eg choice group `(a|b|c)` followed by a shared tail
+* Added LLVM libFuzzer support
+* Made CLIgen spec parser reentrant
+
 ### Corrected Bugs
 
+* Fixed: [Empty enum/bit description causes autocli CLI-spec generation to fail with "syntax error: at or before: '"'"](https://github.com/clicon/clixon/issues/684)
+* Fixed: [Auto-completion ignores variable nodes when competing with literal keywords on trailing spaces](https://github.com/clicon/cligen/issues/145)
+  New tabmode flag: bit 5 added
+* Invalid: [Unescaped vertical bar in values does not work](https://github.com/clicon/cligen/issues/144)
+  * Need to escape virtual bar, documented and added tests
+* Fixed: [Partial command matching is incorrectly suppressed by variable validation](https://github.com/clicon/cligen/issues/140)
+
+## 7.8.0
+29 May 2026
+
+### Features
+
+Check before validate in case of "when" statement
+* Part of solution for https://github.com/clicon/cligen/issues/94
+
+### Corrected Bugs
+
+* Fixed: [Inconsistent error messages when mismatching values of int with explicit range](https://github.com/clicon/cligen/issues/146)
 * Fixed: [cli description should be enumeration's desc not the leaf's. for yang enum type](https://github.com/clicon/clixon/issues/183)
 * Fixed: [Custom Expansion Functions called twice on Pressing TAB](https://github.com/clicon/cligen/issues/92)
 * Fixed: [Validation of Partial match](https://github.com/clicon/cligen/issues/134)
